@@ -1,0 +1,169 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    permissions: write-all
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Read package ID from build.gradle
+        id: read_package_id
+        run: |
+          PACKAGE_ID=$(grep -oP 'applicationId "\K[^"]+' android/app/build.gradle)
+          echo "PACKAGE_ID=${PACKAGE_ID}" >> $GITHUB_ENV
+
+      - name: Build APK and AppBundle
+        id: build
+        run: |
+          echo "Build started at $(date)"
+          echo "BUILD_START_TIME=$(date -d "$(date)" +'%s')" >> $GITHUB_ENV
+          flutter build apk --target-platform android-arm64
+          echo "BUILD_END_TIME=$(date -d "$(date)" +'%s')" >> $GITHUB_ENV
+          echo "Build ended at $(date)"
+      
+      - name: Format build end time
+        id: format_time
+        run: |
+          BUILD_TIME_SUFFIX=$(date +"_%d-%m-%H-%M")
+          echo "BUILD_TIME_SUFFIX=${BUILD_TIME_SUFFIX}" >> $GITHUB_ENV
+
+      - name: Create GoFile upload script
+        run: |
+          echo '#!/bin/bash' > upload_gofile.sh
+          echo '' >> upload_gofile.sh
+          echo 'if [[ "$#"  ==  '\''0'\'' ]]; then' >> upload_gofile.sh
+          echo 'echo  -e '\''ERROR: No File Specified!'\'' && exit 1' >> upload_gofile.sh
+          echo 'fi' >> upload_gofile.sh
+          echo 'FILE="@$1"' >> upload_gofile.sh
+          echo 'SERVER=$(curl -s https://api.gofile.io/servers | jq -r '\''.data.servers[0].name'\'')' >> upload_gofile.sh
+          echo 'LINK=$(curl -# -F file=${FILE} https://${SERVER}.gofile.io/uploadFile | jq -r '\''.data|.downloadPage'\'') 2>&1' >> upload_gofile.sh
+          echo 'echo $LINK' >> upload_gofile.sh
+          chmod +x upload_gofile.sh
+
+      - name: Upload to GitHub Release
+        id: release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build/app/outputs/flutter-apk/app-release.apk
+          asset_name: Rest-App${{ env.BUILD_TIME_SUFFIX }}.apk
+          tag: Release-${{ env.BUILD_TIME_SUFFIX }}
+          body: |
+            **Package ID:** `${{ env.PACKAGE_ID }}`
+            **Top Commit Message:** `${{ github.event.head_commit.message }}`
+            **Top Commit URL:** [View Commit](${{ github.event.head_commit.url }})
+            **Repository URL:** [${{ github.repository }}](https://github.com/${{ github.repository }})
+            **Download APK:** [Download](${{ env.FILE_URL }})
+
+      - name: Rename APK for GoFile
+        run: |
+          mv build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/Rest-App${{ env.BUILD_TIME_SUFFIX }}.apk
+
+      - name: Upload APK to GoFile
+        id: upload_gofile
+        run: |
+          ./upload_gofile.sh build/app/outputs/flutter-apk/Rest-App${{ env.BUILD_TIME_SUFFIX }}.apk > gofile_link.txt
+          FILE_URL=$(cat gofile_link.txt)
+          echo "FILE_URL=${FILE_URL}" >> $GITHUB_ENV
+
+      - name: Get Flutter version
+        id: get_version
+        run: |
+          FLUTTER_VERSION=$(flutter --version | grep 'Flutter' | awk '{print $2}')
+          echo "FLUTTER_VERSION=${FLUTTER_VERSION}" >> $GITHUB_ENV
+
+      - name: Count lines of code and files in lib folder
+        id: count_lines
+        run: |
+          LOC=$(find lib -name '*.dart' | xargs wc -l | tail -n 1 | awk '{print $1}')
+          FILE_COUNT=$(find lib -name '*.dart' | wc -l)
+          echo "LOC=${LOC}" >> $GITHUB_ENV
+          echo "FILE_COUNT=${FILE_COUNT}" >> $GITHUB_ENV
+
+      - name: Count number of commits
+        id: commit_count
+        run: |
+          git fetch --unshallow
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          echo "COMMIT_COUNT=${COMMIT_COUNT}" >> $GITHUB_ENV
+
+      - name: Count completed workflows
+        id: workflow_count
+        run: |
+          WORKFLOW_COUNT=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=completed" | \
+          jq -r '.total_count')
+          echo "WORKFLOW_COUNT=${WORKFLOW_COUNT}" >> $GITHUB_ENV
+
+      - name: Release Information
+        run: |
+          echo "Ref: ${{ github.ref }}"
+          echo "Ref type: ${{ github.ref_type }}"
+
+      - name: Post to Telegram Channel
+        if: ${{ success() && github.ref == 'refs/heads/main' && github.ref_type != 'tag' }}
+        env:
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          BUILD_START_TIME: ${{ env.BUILD_START_TIME }}
+          BUILD_END_TIME: ${{ env.BUILD_END_TIME }}
+          PACKAGE_ID: ${{ env.PACKAGE_ID }}
+          FILE_URL: ${{ env.FILE_URL }}
+          REPO_URL: ${{ github.repository }}
+          GITHUB_RELEASE_URL: ${{ steps.release.outputs.upload_url }}
+          BUILD_MACHINE: ${{ runner.os }}
+          FLUTTER_VERSION: ${{ env.FLUTTER_VERSION }}
+          LOC: ${{ env.LOC }}
+          FILE_COUNT: ${{ env.FILE_COUNT }}
+          COMMIT_COUNT: ${{ env.COMMIT_COUNT }}
+          WORKFLOW_COUNT: ${{ env.WORKFLOW_COUNT }}
+        run: |
+          if [ ! -z "${{ secrets.BOT_TOKEN }}" ]; then
+              GITHUB_SHA_SHORT=$(git rev-parse --short HEAD)
+              BUILD_DURATION=$((BUILD_END_TIME - BUILD_START_TIME))
+              BUILD_DURATION_HOURS=$((BUILD_DURATION / 3600))
+              BUILD_DURATION_MINUTES=$(( (BUILD_DURATION % 3600) / 60 ))
+              BUILD_DURATION_SECONDS=$((BUILD_DURATION % 60))
+              BUILD_DURATION_STR="${BUILD_DURATION_HOURS}h ${BUILD_DURATION_MINUTES}m ${BUILD_DURATION_SECONDS}s"
+              TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+              CAPTION="<b>Build Duration:</b> <code>${BUILD_DURATION_STR}</code>%0A<b>Build Timestamp:</b> <code>${TIMESTAMP}</code>%0A<b>Build Machine OS:</b> <code>${BUILD_MACHINE}</code>%0A<b>Flutter Version:</b> <code>${FLUTTER_VERSION}</code>%0A<b>Project Lines of Code:</b> <code>${LOC}</code>%0A<b>Project Number of Files:</b> <code>${FILE_COUNT}</code>%0A<b>Total Commits:</b> <code>${COMMIT_COUNT}</code>%0A<b>Completed Workflows:</b> <code>${WORKFLOW_COUNT}</code>%0A<b>Package ID:</b> <code>${PACKAGE_ID}</code>%0A<b>Top Commit Message:</b> <code>${COMMIT_MESSAGE}</code>%0A<b>Top Commit URL:</b> <a href=\"${COMMIT_URL}\">View Commit</a>%0A<b>Repository URL:</b> <a href=\"https://github.com/${REPO_URL}\">${REPO_URL}</a>%0A<b>Download APK:</b> <a href=\"${FILE_URL}\">Download</a>"
+              
+              # Attempt to send document with caption
+              curl -s -F chat_id=${CHANNEL_ID} \
+                  -F document=@build/app/outputs/flutter-apk/Rest-App${{ env.BUILD_TIME_SUFFIX }}.apk \
+                  -F caption="${CAPTION}" \
+                  -F parse_mode="HTML" \
+                  "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" || {
+                  # If document sending fails, fallback to sending message only
+                  echo "Failed to send document, sending message only"
+                  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                    -d chat_id=${CHANNEL_ID} \
+                    -d parse_mode="HTML" \
+                    -d text="${CAPTION}" || {
+                      echo "Failed to send message to Telegram" >&2
+                      exit 1
+                  }
+              }
+              echo "Message successfully sent to Telegram"
+          else
+              echo "BOT_TOKEN is not set" >&2
+              exit 1
+          fi
